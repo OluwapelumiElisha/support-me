@@ -18,6 +18,7 @@ import { WalletMenu } from '@/components/WalletMenu';
 const LINKS = [
   { href: '/app', label: 'App', icon: GridViewIcon },
   { href: '/dashboard', label: 'Dashboard', icon: DashboardSquare01Icon },
+  { href: '/discover', label: 'Discover', icon: Search01Icon },
   { href: '/app/subscriptions', label: 'Subscriptions', icon: RepeatIcon },
   { href: '/activity', label: 'Activity', icon: Activity01Icon },
   { href: '/settings', label: 'Settings', icon: Settings01Icon },

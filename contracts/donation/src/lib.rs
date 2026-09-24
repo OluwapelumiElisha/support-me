@@ -32,6 +32,7 @@ const REGISTRY_KEY: Symbol = symbol_short!("registry");
 const SUBSCRIPTIONS_KEY: Symbol = symbol_short!("subs");
 const SUB_COUNTER: Symbol = symbol_short!("sub_ctr");
 const EXECUTOR_KEY: Symbol = symbol_short!("executor");
+pub const MAX_MEMO_LENGTH: u32 = 140;
 
 /// Emitted whenever a donation is settled on-chain.
 #[contractevent(topics = ["donated"])]
@@ -354,6 +355,10 @@ impl DonationContract {
         assert!(!Self::is_paused(env.clone()), "contract is currently paused");
         donor.require_auth();
         assert!(amount > 0, "Donation amount must be positive");
+        assert!(
+            memo.len() <= MAX_MEMO_LENGTH,
+            "Donation memo exceeds maximum length"
+        );
 
         let token_client = token::Client::new(&env, &token);
         token_client.transfer(&donor, &creator, &amount);
@@ -713,6 +718,8 @@ mod tests {
         assert_eq!(donation.amount, 1000);
         assert_eq!(donation.donor, donor);
         assert_eq!(donation.creator, creator);
+        assert_eq!(donation.memo, String::from_bytes(&env, b"Great work!"));
+        assert_eq!(donation_client.get_donation(&0).unwrap().memo, donation.memo);
 
         let token_client = token::Client::new(&env, &token_address);
         assert_eq!(token_client.balance(&creator), 1000);

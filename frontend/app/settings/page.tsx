@@ -249,7 +249,7 @@ export default function SettingsPage() {
                     type="button"
                     onClick={() => fileInputRef.current?.click()}
                     disabled={uploading}
-                    className="btn-brutal btn-brutal-white gap-1.5"
+                    className="btn-brutal btn-brutal-white gap-1.5 min-h-[44px] px-4 flex items-center justify-center font-bold"
                   >
                     <HugeiconsIcon icon={ImageUpload01Icon} size={18} strokeWidth={2} />
                     {uploading ? 'Uploading…' : 'Upload avatar'}
@@ -272,7 +272,7 @@ export default function SettingsPage() {
                   }}
                   maxLength={80}
                   placeholder={creator.username}
-                  className="input-brutal"
+                  className="input-brutal min-h-[44px]"
                 />
               </div>
 
@@ -290,7 +290,7 @@ export default function SettingsPage() {
                   maxLength={500}
                   rows={4}
                   placeholder="Tell supporters what you're about."
-                  className="input-brutal resize-y"
+                  className="input-brutal resize-y text-base sm:text-sm"
                 />
                 <p className="text-xs text-muted mt-2 font-medium text-right">{bio.length}/500</p>
               </div>
@@ -301,7 +301,7 @@ export default function SettingsPage() {
               <h2 className="text-lg font-extrabold text-ink">Payments</h2>
               <p className="text-sm text-muted font-medium">Choose which assets supporters can tip you in.</p>
 
-              <label className="flex items-center justify-between gap-4 cursor-pointer">
+              <label className="flex items-center justify-between gap-4 cursor-pointer min-h-[44px] py-1">
                 <span className="font-bold text-ink">Accept XLM</span>
                 <input
                   type="checkbox"
@@ -310,10 +310,10 @@ export default function SettingsPage() {
                     setAcceptsXlm(e.target.checked);
                     setDirty(true);
                   }}
-                  className="w-5 h-5 accent-primary"
+                  className="w-5 h-5 accent-primary min-h-[20px] min-w-[20px]"
                 />
               </label>
-              <label className="flex items-center justify-between gap-4 cursor-pointer">
+              <label className="flex items-center justify-between gap-4 cursor-pointer min-h-[44px] py-1">
                 <span className="font-bold text-ink">Accept USDC</span>
                 <input
                   type="checkbox"
@@ -322,7 +322,7 @@ export default function SettingsPage() {
                     setAcceptsUsdc(e.target.checked);
                     setDirty(true);
                   }}
-                  className="w-5 h-5 accent-primary"
+                  className="w-5 h-5 accent-primary min-h-[20px] min-w-[20px]"
                 />
               </label>
 
@@ -341,7 +341,7 @@ export default function SettingsPage() {
                     setDirty(true);
                   }}
                   placeholder="e.g. 1000"
-                  className="input-brutal"
+                  className="input-brutal min-h-[44px]"
                 />
               </div>
             </section>
@@ -367,7 +367,7 @@ export default function SettingsPage() {
                         setDirty(true);
                       }}
                       placeholder={platform.label}
-                      className="input-brutal pl-11"
+                      className="input-brutal pl-11 min-h-[44px]"
                     />
                   </div>
                 ))}
@@ -378,7 +378,7 @@ export default function SettingsPage() {
               <button
                 onClick={handleSave}
                 disabled={saving || uploading}
-                className="btn-brutal btn-brutal-primary w-full"
+                className="btn-brutal btn-brutal-primary w-full min-h-[48px] text-base font-extrabold flex items-center justify-center"
               >
                 {saving ? 'Saving…' : 'Save changes'}
               </button>

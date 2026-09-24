@@ -294,7 +294,7 @@ export default function DashboardPage() {
           </div>
 
           {/* Recent Activity — tips received and cash-outs, newest first */}
-          <div className="card-brutal p-6">
+          <div className="card-brutal p-4 sm:p-6 overflow-x-auto">
             <h2 className="text-lg font-extrabold text-ink mb-4">Recent Activity</h2>
             {activity.length === 0 ? (
               <p className="text-muted font-medium">No activity yet. Share your profile link to get started!</p>

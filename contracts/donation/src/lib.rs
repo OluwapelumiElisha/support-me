@@ -42,12 +42,15 @@ pub struct DonatedEvent {
     pub donor: Address,
     #[topic]
     pub creator: Address,
+    pub token: Address,
     pub amount: i128,
     pub memo: String,
     pub timestamp: u64,
 }
 
-/// Emitted when a supporter starts a recurring donation.
+/// Emitted when a supporter starts a recurring donation. Carries `token`
+/// and `next_charge_at` so the backend can create and reconcile schedules
+/// directly from the event stream.
 #[contractevent(topics = ["subscribed"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscribedEvent {
@@ -56,16 +59,21 @@ pub struct SubscribedEvent {
     #[topic]
     pub creator: Address,
     pub subscription_id: u64,
+    pub token: Address,
     pub amount: i128,
     pub interval_secs: u64,
+    pub next_charge_at: u64,
 }
 
-/// Emitted when a supporter cancels a recurring donation.
+/// Emitted when a supporter cancels a recurring donation. Indexed by both
+/// supporter and creator so both dashboards can track cancellations.
 #[contractevent(topics = ["sub_cancelled"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscriptionCancelledEvent {
     #[topic]
     pub supporter: Address,
+    #[topic]
+    pub creator: Address,
     pub subscription_id: u64,
 }
 
@@ -372,6 +380,7 @@ impl DonationContract {
             donor: donor.clone(),
             creator: creator.clone(),
             amount,
+            fee_amount: 0,
             memo: memo.clone(),
             timestamp: env.ledger().timestamp(),
         };
@@ -392,6 +401,7 @@ impl DonationContract {
         DonatedEvent {
             donor,
             creator,
+            token,
             amount,
             memo,
             timestamp: env.ledger().timestamp(),
@@ -421,7 +431,7 @@ impl DonationContract {
         let subscription = Subscription {
             supporter: supporter.clone(),
             creator: creator.clone(),
-            token,
+            token: token.clone(),
             amount,
             interval_secs,
             next_charge_at: now + interval_secs,
@@ -437,8 +447,10 @@ impl DonationContract {
             supporter,
             creator,
             subscription_id: id,
+            token,
             amount,
             interval_secs,
+            next_charge_at: now + interval_secs,
         }
         .publish(&env);
 
@@ -492,6 +504,7 @@ impl DonationContract {
             donor: subscription.supporter.clone(),
             creator: subscription.creator.clone(),
             amount: subscription.amount,
+            fee_amount: 0,
             memo: memo.clone(),
             timestamp: now,
         };
@@ -516,6 +529,7 @@ impl DonationContract {
         DonatedEvent {
             donor: subscription.supporter.clone(),
             creator: subscription.creator.clone(),
+            token: subscription.token.clone(),
             amount: subscription.amount,
             memo,
             timestamp: now,
@@ -549,6 +563,7 @@ impl DonationContract {
 
         SubscriptionCancelledEvent {
             supporter,
+            creator: subscription.creator,
             subscription_id,
         }
         .publish(&env);

@@ -1,11 +1,12 @@
 'use client';
 
-import { useState, useEffect, useMemo, use } from 'react';
+import { useState, useEffect, useMemo, useCallback, use } from 'react';
 import Image from 'next/image';
+import Link from 'next/link';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import { notify } from '@/lib/notify';
 import { HugeiconsIcon } from '@hugeicons/react';
-import { PartyIcon } from '@hugeicons/core-free-icons';
+import { PartyIcon, TwitterIcon, LinkIcon } from '@hugeicons/core-free-icons';
 import { connectWallet } from '@/lib/wallet';
 import {
   categorizeWalletError,
@@ -17,14 +18,15 @@ import {
   MAX_MEMO_LENGTH,
   approveAllowance,
   subscribe,
-  DonationError,
   MAX_CHARGE_INTERVAL_DAYS,
 } from '@/lib/contract';
 import { availableAssetCodes, getAsset } from '@/lib/assets';
 import { getPlatform } from '@/lib/socials';
 import { API_URL } from '@/lib/api';
+import { describeDonationFailure } from '@/lib/failures';
 import { useAuth } from '@/context/AuthContext';
 import { Skeleton } from '@/components/Skeleton';
+import { ProfileSkeleton } from '@/components/ProfileSkeleton';
 import { TipJarLoader } from '@/components/TipJarLoader';
 
 
@@ -49,25 +51,25 @@ interface Creator {
   socialLinks: Record<string, string> | null;
   acceptsXlm: boolean;
   acceptsUsdc: boolean;
+  acceptsUsdt: boolean;
   donationGoal: number | null;
-  donations: Donation[];
 }
 
-interface Donation {
-  id: number | string;
-  senderAddress: string;
-  amount: number;
+interface Goal {
+  id: number;
+  title: string | null;
+  targetAmount: number;
+  currentAmount: number;
   currency: string;
-  message: string;
-  createdAt: string;
-  transactionHash?: string;
+  status: 'ACTIVE' | 'COMPLETED' | 'EXPIRED';
+  recurring: boolean;
 }
 
 export default function CreatorProfileClient({ params }: { params: Promise<{ username: string }> }) {
   const { username } = use(params);
   const { token, loginWithWallet } = useAuth();
   const [creator, setCreator] = useState<Creator | null>(null);
-  const [donations, setDonations] = useState<Donation[]>([]);
+  const [goals, setGoals] = useState<Goal[]>([]);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
 
@@ -91,15 +93,38 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
   const presets = ['1', '5', '10', '20'];
 
   // Only offer assets the creator actually accepts, intersected with what this
-  // deployment supports (USDC only appears when an issuer is configured).
+  // deployment supports (USDC/USDT only appear when their issuer is configured).
   const assetCodes = useMemo(() => {
     if (!creator) return [];
     return availableAssetCodes().filter((code) => {
       if (code === 'XLM') return creator.acceptsXlm;
       if (code === 'USDC') return creator.acceptsUsdc;
+      if (code === 'USDT') return creator.acceptsUsdt;
       return true;
     });
   }, [creator]);
+
+  // Goal progress lives entirely server-side (Goal.currentAmount, updated by
+  // the backend as donations come in — see goalService.ts) rather than being
+  // derived here by summing donations, since a single donation can now count
+  // toward several simultaneously-active goals. Only ACTIVE goals are shown;
+  // a COMPLETED (non-recurring, target reached) or EXPIRED goal drops off the
+  // profile's goal bar list.
+  // useCallback (keyed only on username, not on every render) so the SSE
+  // effect below can safely list it as a dependency without resubscribing on
+  // every render.
+  const fetchGoals = useCallback(async () => {
+    try {
+      const res = await fetch(
+        `${API_URL}/api/goals/${encodeURIComponent(username)}?status=ACTIVE`
+      );
+      if (!res.ok) return;
+      const data = await res.json();
+      setGoals(Array.isArray(data) ? data : data.items || []);
+    } catch {
+      // Non-fatal: the profile still renders without goal bars.
+    }
+  }, [username]);
 
   useEffect(() => {
     const fetchCreator = async () => {
@@ -108,13 +133,7 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
         if (!res.ok) throw new Error('Creator not found');
         const data: Creator = await res.json();
         setCreator(data);
-        const donationsRes = await fetch(
-          `${API_URL}/api/donations?creatorUsername=${encodeURIComponent(username)}&page=1&limit=20`
-        );
-        if (donationsRes.ok) {
-          const donationsData = await donationsRes.json();
-          setDonations(Array.isArray(donationsData) ? donationsData : donationsData.items || []);
-        }
+        await fetchGoals();
       } catch {
         setNotFound(true);
       } finally {
@@ -122,7 +141,7 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
       }
     };
     fetchCreator();
-  }, [username]);
+  }, [username, fetchGoals]);
 
   // Default the selected asset to the first one the creator accepts, once the
   // profile loads.
@@ -140,14 +159,7 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
     const source = new EventSource(`${API_URL}/api/events`);
 
     const handleDonation = (event: MessageEvent) => {
-      let payload: {
-        donor: string;
-        creator: string;
-        amount: string;
-        memo: string;
-        timestamp: number;
-        txHash: string;
-      };
+      let payload: { creator: string };
       try {
         payload = JSON.parse(event.data);
       } catch {
@@ -156,19 +168,9 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
 
       if (payload.creator !== creator.walletAddress) return;
 
-      setDonations((prev) => {
-        if (prev.some((d) => d.transactionHash === payload.txHash)) return prev;
-        const newDonation: Donation = {
-          id: payload.txHash,
-          senderAddress: payload.donor,
-          amount: Number(payload.amount) / 1e7,
-          currency: 'XLM',
-          message: payload.memo,
-          createdAt: new Date(payload.timestamp * 1000).toISOString(),
-          transactionHash: payload.txHash,
-        };
-        return [newDonation, ...prev];
-      });
+      // The SSE event only carries the on-chain payment, not which goal(s) it
+      // was applied to server-side — refetch rather than guess at the split.
+      void fetchGoals();
     };
 
     source.addEventListener('donation', handleDonation);
@@ -177,7 +179,7 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
       source.removeEventListener('donation', handleDonation);
       source.close();
     };
-  }, [creator?.walletAddress]);
+  }, [creator?.walletAddress, fetchGoals]);
 
   // Read the connected wallet's balance for whichever asset is selected. Falls
   // back to null when the wallet holds no trustline/balance for it.
@@ -195,6 +197,7 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
     setConnecting(true);
     try {
       const address = await connectWallet();
+      if (!address) return;
       setUserAddress(address);
       setBalance(await loadAssetBalance(address, assetCode));
       notify.success('Wallet connected!');
@@ -263,6 +266,9 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
       });
 
       setBalance(await loadAssetBalance(userAddress, assetCode));
+      // The record call (if it succeeded) already applied this donation to
+      // any matching active goals server-side — pick up the new totals.
+      if (recordRes.ok) await fetchGoals();
 
       const txLink = (
         <a
@@ -292,19 +298,8 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
       setDonationAmount('5');
       setDonationMessage('');
     } catch (err) {
-      // Three user-facing categories: 'wallet' (not connected / signing
-      // rejected), 'simulation' (invalid amount, insufficient balance), and
-      // 'network' (RPC/submission/confirmation failure).
-      if (err instanceof DonationError) {
-        const titles: Record<string, string> = {
-          wallet: 'Wallet error',
-          simulation: 'Transaction rejected',
-          network: 'Network error',
-        };
-        notify.error(titles[err.type] || 'Donation failed', err);
-      } else {
-        notify.error('Donation failed', err);
-      }
+      const failure = describeDonationFailure(err, 'donate');
+      notify.error(failure.title, `${failure.message} ${failure.action}`);
     } finally {
       setSending(false);
       setTxStatus(null);
@@ -331,8 +326,14 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
     try {
       let address = userAddress;
       if (!address) {
-        address = await connectWallet();
+        const connected = await connectWallet();
+        if (!connected) return;
+        address = connected;
         setUserAddress(address);
+      }
+      if (!address) {
+        setSending(false);
+        return;
       }
 
       // Recording a subscription (so the supporter can later see/cancel it)
@@ -398,16 +399,8 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
       setDonationAmount('5');
       setDonationMessage('');
     } catch (err) {
-      if (err instanceof DonationError) {
-        const titles: Record<string, string> = {
-          wallet: 'Wallet error',
-          simulation: 'Transaction rejected',
-          network: 'Network error',
-        };
-        notify.error(titles[err.type] || 'Could not start subscription', err);
-      } else {
-        notify.error('Could not start subscription', err);
-      }
+      const failure = describeDonationFailure(err, 'subscribe');
+      notify.error(failure.title, `${failure.message} ${failure.action}`);
     } finally {
       setSending(false);
       setTxStatus(null);
@@ -416,18 +409,7 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
   };
 
   if (loading) {
-    return (
-      <div className="min-h-screen bg-background py-10 px-4">
-        <div className="max-w-md mx-auto">
-          <div className="card-brutal p-8 text-center">
-            <Skeleton className="h-24 w-24 rounded-full mx-auto mb-4" />
-            <Skeleton className="h-8 w-48 mx-auto mb-2" />
-            <Skeleton className="h-5 w-32 mx-auto mb-6" />
-            <Skeleton className="h-10 w-full" />
-          </div>
-        </div>
-      </div>
-    );
+    return <ProfileSkeleton />;
   }
 
   if (notFound || !creator) {
@@ -446,22 +428,29 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
   const socialLinks = creator.socialLinks || {};
   const socialEntries = Object.entries(socialLinks).filter(([, url]) => url);
 
-  const goal = creator.donationGoal;
-  // The goal isn't tied to a currency in the schema, so it's assumed to be
-  // denominated in whichever asset the creator actually accepts — XLM if
-  // they take both, otherwise USDC. Without this, a USDC-only creator's goal
-  // bar would sum an asset they never receive and stay stuck at 0%.
-  const goalCurrency = creator.acceptsXlm ? 'XLM' : 'USDC';
-  const goalReceived = donations
-    .filter((d) => d.currency === goalCurrency)
-    .reduce((sum, d) => sum + d.amount, 0);
-  const goalPct = goal ? Math.min(100, (goalReceived / goal) * 100) : 0;
-
   const displayName = creator.displayName || creator.username;
+  const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || 'https://support-mee.vercel.app';
+  const profileUrl = `${SITE_URL}/${creator.username}`;
+
+  const handleShareOnTwitter = () => {
+    const text = encodeURIComponent(`Support ${displayName} (@${creator.username}) on SupportMe!`);
+    const url = encodeURIComponent(profileUrl);
+    window.open(`https://twitter.com/intent/tweet?text=${text}&url=${url}`, '_blank');
+  };
+
+  const handleCopyLink = async () => {
+    try {
+      await navigator.clipboard.writeText(profileUrl);
+      notify.success('Link copied to clipboard!');
+    } catch {
+      notify.error('Failed to copy link');
+    }
+  };
 
   return (
     <div className="min-h-screen bg-background py-10 px-4">
       <div className="max-w-md mx-auto space-y-6">
+
         {/* Creator header */}
         <div className="card-brutal p-8 text-center">
           <div className="w-24 h-24 mx-auto mb-4 rounded-full border-4 border-ink overflow-hidden bg-accent-bg flex items-center justify-center">
@@ -507,21 +496,61 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
             </div>
           )}
 
-          {goal && (
-            <div className="mt-6 pt-6 border-t-2 border-ink text-left">
-              <div className="flex justify-between text-sm font-bold text-ink mb-2">
-                <span>{goalReceived.toFixed(0)} / {goal} {goalCurrency}</span>
-                <span>{goalPct.toFixed(0)}%</span>
-              </div>
-              <div
-                className="h-3 border-2 border-ink rounded-full overflow-hidden bg-accent-bg"
-                role="progressbar"
-                aria-valuenow={Math.round(goalPct)}
-                aria-valuemin={0}
-                aria-valuemax={100}
-              >
-                <div className="h-full bg-brand-lime" style={{ width: `${goalPct}%` }} />
-              </div>
+          <div className="flex items-center justify-center gap-2 mt-4">
+            <button
+              onClick={handleShareOnTwitter}
+              className="btn-brutal btn-brutal-white px-3 py-2 text-sm flex items-center gap-2"
+              aria-label="Share on X/Twitter"
+            >
+              <HugeiconsIcon icon={TwitterIcon} size={18} strokeWidth={2} />
+              Share
+            </button>
+            <button
+              onClick={handleCopyLink}
+              className="btn-brutal btn-brutal-white px-3 py-2 text-sm flex items-center gap-2"
+              aria-label="Copy profile link"
+            >
+              <HugeiconsIcon icon={LinkIcon} size={18} strokeWidth={2} />
+              Copy Link
+            </button>
+          </div>
+
+          {goals.length > 0 && (
+            <div className="mt-6 pt-6 border-t-2 border-ink text-left space-y-4">
+              {goals.map((g) => {
+                // Progress is whatever the backend has already computed for
+                // this goal (Goal.currentAmount) — never re-derived here by
+                // summing donations, since a donation can count toward
+                // several active goals at once (see goalService.ts).
+                const pct = Math.min(100, (g.currentAmount / g.targetAmount) * 100);
+                return (
+                  <div key={g.id}>
+                    <div className="flex justify-between text-sm font-bold text-ink mb-2 gap-2">
+                      <span className="truncate">
+                        {g.title || 'Goal'}
+                        {g.recurring && (
+                          <span className="ml-1.5 text-[10px] font-extrabold uppercase tracking-wide text-ink/60 align-middle">
+                            Recurring
+                          </span>
+                        )}
+                      </span>
+                      <span className="shrink-0">
+                        {g.currentAmount.toFixed(0)} / {g.targetAmount.toFixed(0)} {g.currency}
+                      </span>
+                    </div>
+                    <div
+                      className="h-3 border-2 border-ink rounded-full overflow-hidden bg-accent-bg"
+                      role="progressbar"
+                      aria-valuenow={Math.round(pct)}
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-label={g.title || `${g.currency} goal`}
+                    >
+                      <div className="h-full bg-brand-lime" style={{ width: `${pct}%` }} />
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
@@ -551,13 +580,13 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
             <button
               onClick={handleConnectWallet}
               disabled={connecting}
-              className="btn-brutal btn-brutal-primary w-full"
+              className="btn-brutal btn-brutal-primary w-full min-h-[48px] text-base font-extrabold flex items-center justify-center"
             >
               {connecting ? 'Connecting…' : 'Connect Wallet'}
             </button>
           ) : (
             <div className="space-y-4">
-              <div className="card-brutal bg-brand-lime p-3 text-sm">
+              <div className="card-brutal bg-brand-lime p-3.5 text-sm">
                 <p className="text-ink font-medium">Wallet: {userAddress.slice(0, 8)}…</p>
                 <p className="text-ink font-extrabold mt-1">
                   {balance ?? '0.0000'} {assetCode}
@@ -578,7 +607,7 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
                           }
                         }}
                         aria-pressed={assetCode === code}
-                        className={`btn-brutal text-sm px-0 py-2 ${
+                        className={`btn-brutal text-sm px-0 min-h-[44px] flex items-center justify-center font-bold ${
                           assetCode === code ? 'btn-brutal-primary' : 'btn-brutal-white'
                         }`}
                       >
@@ -600,7 +629,7 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
                   step="0.1"
                   value={donationAmount}
                   onChange={(e) => setDonationAmount(e.target.value)}
-                  className="input-brutal"
+                  className="input-brutal min-h-[44px] text-base"
                 />
               </div>
 
@@ -609,7 +638,7 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
                   <button
                     key={preset}
                     onClick={() => setDonationAmount(preset)}
-                    className={`btn-brutal text-sm px-0 py-2 ${
+                    className={`btn-brutal text-sm px-0 min-h-[44px] flex items-center justify-center font-bold ${
                       donationAmount === preset ? 'btn-brutal-primary' : 'btn-brutal-white'
                     }`}
                   >
@@ -628,29 +657,29 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
                   onChange={(e) => setDonationMessage(e.target.value)}
                     maxLength={MAX_MEMO_LENGTH}
                   placeholder="Thanks for your work!"
-                  className="input-brutal text-sm"
+                  className="input-brutal text-base sm:text-sm"
                   rows={3}
                 />
                   <p className="text-xs text-muted mt-1 font-medium">{donationMessage.length}/{MAX_MEMO_LENGTH}</p>
               </div>
 
-              <div className="flex items-center justify-between gap-3">
-                <label className="flex items-center gap-2 text-sm font-bold text-ink">
+              <div className="flex flex-wrap items-center justify-between gap-3 min-h-[44px]">
+                <label className="flex items-center gap-2 text-sm font-bold text-ink cursor-pointer py-1">
                   <input
                     type="checkbox"
                     checked={recurring}
                     onChange={(e) => setRecurring(e.target.checked)}
-                    className="h-4 w-4 accent-primary"
+                    className="h-5 w-5 accent-primary min-h-[20px] min-w-[20px]"
                   />
                   Make it recurring
                 </label>
 
                 {recurring && (
-                  <div className="flex items-center gap-1.5">
+                  <div className="flex items-center gap-1.5 shrink-0">
                     <select
                       value={intervalChoice}
                       onChange={(e) => setIntervalChoice(e.target.value as typeof intervalChoice)}
-                      className="input-brutal text-sm py-1.5 w-auto"
+                      className="input-brutal text-sm py-2 min-h-[44px] w-auto"
                     >
                       <option value="7">Weekly</option>
                       <option value="30">Monthly</option>
@@ -666,7 +695,7 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
                         onChange={(e) => setCustomDays(e.target.value)}
                         aria-label="Days between charges"
                         title={`Up to ${MAX_CHARGE_INTERVAL_DAYS} days`}
-                        className="input-brutal text-sm py-1.5 w-14"
+                        className="input-brutal text-sm py-2 min-h-[44px] w-16"
                       />
                     )}
                   </div>
@@ -685,7 +714,7 @@ export default function CreatorProfileClient({ params }: { params: Promise<{ use
               <button
                 onClick={recurring ? handleStartSubscription : handleSendDonation}
                 disabled={sending || !creator.walletAddress}
-                className="btn-brutal btn-brutal-lime w-full"
+                className="btn-brutal btn-brutal-lime w-full min-h-[48px] text-base font-extrabold flex items-center justify-center"
               >
                 {recurring ? 'Start Recurring Donation' : 'Send Donation'}
               </button>

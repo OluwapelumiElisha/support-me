@@ -26,6 +26,7 @@ const PROPOSAL_COUNTER_KEY: Symbol = symbol_short!("prop_ctr");
 const PROPOSAL_KEY: Symbol = symbol_short!("proposal");
 const APPROVAL_KEY: Symbol = symbol_short!("approval");
 const DONATION_KEY: Symbol = symbol_short!("don_ctr");
+const GOAL_KEY: Symbol = symbol_short!("goal");
 
 /// Emitted whenever a new creator profile is registered.
 #[contractevent(topics = ["created"])]
@@ -342,6 +343,36 @@ impl CreatorRegistryContract {
         profile.donation_count += 1;
 
         env.storage().persistent().set(&creator, &profile);
+
+        // Emit event with full payload so downstream backends/indexers can
+        // reconcile lifetime statistics without extra RPC calls.
+        DonationRecordedEvent {
+            creator,
+            amount,
+            total_donations: profile.total_donations,
+            donation_count: profile.donation_count,
+        }
+        .publish(&env);
+    }
+
+    /// Sets or updates a creator's funding goal. Must be authenticated by the creator.
+    pub fn set_goal(env: Env, creator: Address, goal_amount: i128) {
+        creator.require_auth();
+        assert!(goal_amount >= 0, "Goal amount cannot be negative");
+
+        env.storage().persistent().set(&(GOAL_KEY, creator.clone()), &goal_amount);
+
+        GoalUpdatedEvent {
+            creator,
+            goal_amount,
+            updated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Reads a creator's funding goal, if set.
+    pub fn get_goal(env: Env, creator: Address) -> Option<i128> {
+        env.storage().persistent().get(&(GOAL_KEY, creator))
     }
 
     fn contains_address(vec: &SorobanVec<Address>, target: &Address) -> bool {

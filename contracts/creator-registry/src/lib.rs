@@ -12,6 +12,7 @@ use soroban_sdk::{contract, contractevent, contractimpl, symbol_short, Address, 
 
 const ADMIN_KEY: Symbol = symbol_short!("admin");
 const DONATION_KEY: Symbol = symbol_short!("don_ctr");
+const GOAL_KEY: Symbol = symbol_short!("goal");
 
 /// Emitted whenever a new creator profile is registered.
 #[contractevent(topics = ["created"])]
@@ -20,6 +21,29 @@ pub struct CreatedEvent {
     #[topic]
     pub creator: Address,
     pub username: String,
+}
+
+/// Emitted whenever a donation is recorded in the registry. Carries the
+/// donation amount as well as updated cumulative totals so indexers and
+/// the backend can reconcile lifetime creator stats without extra RPC calls.
+#[contractevent(topics = ["don_rec"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DonationRecordedEvent {
+    #[topic]
+    pub creator: Address,
+    pub amount: i128,
+    pub total_donations: i128,
+    pub donation_count: u32,
+}
+
+/// Emitted whenever a creator sets or updates their funding goal.
+#[contractevent(topics = ["goal_upd"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalUpdatedEvent {
+    #[topic]
+    pub creator: Address,
+    pub goal_amount: i128,
+    pub updated_at: u64,
 }
 
 #[contract]
@@ -113,6 +137,36 @@ impl CreatorRegistryContract {
         profile.donation_count += 1;
 
         env.storage().persistent().set(&creator, &profile);
+
+        // Emit event with full payload so downstream backends/indexers can
+        // reconcile lifetime statistics without extra RPC calls.
+        DonationRecordedEvent {
+            creator,
+            amount,
+            total_donations: profile.total_donations,
+            donation_count: profile.donation_count,
+        }
+        .publish(&env);
+    }
+
+    /// Sets or updates a creator's funding goal. Must be authenticated by the creator.
+    pub fn set_goal(env: Env, creator: Address, goal_amount: i128) {
+        creator.require_auth();
+        assert!(goal_amount >= 0, "Goal amount cannot be negative");
+
+        env.storage().persistent().set(&(GOAL_KEY, creator.clone()), &goal_amount);
+
+        GoalUpdatedEvent {
+            creator,
+            goal_amount,
+            updated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Reads a creator's funding goal, if set.
+    pub fn get_goal(env: Env, creator: Address) -> Option<i128> {
+        env.storage().persistent().get(&(GOAL_KEY, creator))
     }
 }
 
@@ -201,5 +255,22 @@ mod tests {
 
         client.initialize(&admin, &donation_contract);
         client.initialize(&admin, &donation_contract);
+    }
+
+    #[test]
+    fn test_set_and_get_goal() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(CreatorRegistryContract, ());
+        let client = CreatorRegistryContractClient::new(&env, &contract_id);
+
+        let creator = Address::generate(&env);
+        assert_eq!(client.get_goal(&creator), None);
+
+        client.set_goal(&creator, &5000);
+        assert_eq!(client.get_goal(&creator), Some(5000));
+
+        client.set_goal(&creator, &10000);
+        assert_eq!(client.get_goal(&creator), Some(10000));
     }
 }

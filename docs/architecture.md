@@ -8,6 +8,72 @@ together.
 
 ## Architecture Overview
 
+```mermaid
+graph TB
+    subgraph Client["Client Layer"]
+        FE[Frontend<br/>Next.js]
+        Wallet[Stellar Wallets<br/>Freighter, xBull, Albedo, Rabet, Lobstr]
+    end
+
+    subgraph API["API Layer"]
+        BE[Backend API<br/>Express + Prisma]
+        Auth[Auth Middleware<br/>JWT + Wallet Signature]
+        Events[SSE Events<br/>Real-time Updates]
+    end
+
+    subgraph Data["Data Layer"]
+        DB[(PostgreSQL<br/>User, Creator, Donation)]
+        Cache[In-memory Cache<br/>Leaderboard TTL]
+    end
+
+    subgraph Blockchain["Blockchain Layer"]
+        RPC[Stellar Testnet RPC<br/>Soroban]
+        Donation[Donation Contract<br/>Settles donations, logs events]
+        Registry[Creator Registry<br/>Profile state, lifetime totals]
+        SAC[Stellar Asset Contract<br/>Native XLM, USDC, USDT]
+    end
+
+    subgraph External["External Services"]
+        Anchor[Stellar Anchor<br/>SEP-24 Cash-out]
+        Email[Email Service<br/>Notifications]
+    end
+
+    FE -->|HTTP/REST| BE
+    FE -->|SSE| Events
+    FE -->|Wallet Connect| Wallet
+    FE -->|Contract Calls| Donation
+    Wallet -->|Sign Transactions| Donation
+    FE -->|SEP-24| Anchor
+
+    BE --> Auth
+    BE --> DB
+    BE --> Cache
+    BE --> Events
+    BE -->|Poll Events| RPC
+    BE -->|Subscription Executor| Donation
+    BE --> Email
+
+    Donation -->|Cross-contract Call| Registry
+    Donation -->|Token Transfer| SAC
+    Donation -->|Emit Events| RPC
+    Registry -->|Profile Data| Donation
+
+    RPC --> Donation
+    RPC --> Registry
+    RPC --> SAC
+
+    Anchor -->|On-chain Payment| SAC
+
+    style FE fill:#e1f5ff
+    style BE fill:#fff4e1
+    style DB fill:#e8f5e9
+    style Donation fill:#f3e5f5
+    style Registry fill:#f3e5f5
+    style RPC fill:#fce4ec
+```
+
+### Component Descriptions
+
 - **Smart Contracts**: `contracts/`
   - `donation` and `creator-registry` are two independently deployed Soroban
     contracts on Stellar Testnet that talk to each other exclusively through
@@ -38,6 +104,10 @@ together.
     `/settings`. Defaults to the SDF reference anchor on testnet.
   - Subscribes to the backend's SSE stream (`EventSource`) on the dashboard
     and public profile pages so new donations appear live without polling.
+  - Detects offline/network-failure states with a persistent retry banner
+    (`components/OfflineBanner.tsx`, `lib/network.ts` `fetchWithRetry`) and
+    renders donation/subscription failure copy from a shared matrix
+    (`lib/failures.ts`, spec in `docs/design/donation-subscription-failure-states.md`).
   - Tested with Vitest + React Testing Library (components, `AuthContext`,
     and the dashboard page's data/SSE behavior).
 
@@ -47,18 +117,33 @@ together.
     wallet-signature-based auth (JWT), and a denormalized donation history
     used for dashboard queries/stats.
   - Polls the Soroban RPC for `donation` contract events
-    (`services/sorobanEventListener.ts`) and republishes them on an
-    in-process event bus, which `routes/events.ts` streams to connected
-    clients over Server-Sent Events.
+    (`services/sorobanEventListener.ts`) through a failover endpoint pool,
+    idempotently indexes each event by its on-chain identity, and republishes
+    it on an in-process event bus, which `routes/events.ts` streams to
+    connected clients over Server-Sent Events. Browser-reported rows are
+    provisional until the listener verifies the corresponding event.
+  - All backend Soroban reads (health, event polling, and subscription
+    execution) share `services/sorobanRpc.ts`, which supports
+    `SOROBAN_RPC_URLS` and logs the endpoint that served each request.
+  - Privileged admin access and state-changing admin actions are recorded in
+    the append-only `AdminAuditLog` table and exposed at
+    `/api/admin/audit-logs`.
   - Centralized error handling (`errors/`, `middleware/errorHandler.ts`) and
     Zod-based request validation (`middleware/validate.ts`, `schemas/`).
+  - Operational health at `GET /health` (Soroban RPC plus the subscription
+    executor's last-run time and recent charge success/failure counts; overall
+    `unhealthy` when the executor hasn't run within its expected interval) and
+    a focused `GET /health/executor` report.
+  - GDPR-style account endpoints (`GET /api/account/export`,
+    `POST /api/account/delete` with a typed confirmation) that anonymize
+    personal fields while preserving on-chain-referenced records.
   - Tested with Jest + Supertest; Prisma is mocked in tests so the suite
     never touches a real database.
 
 - **Database**: PostgreSQL
-  - Stores `User`, `Creator`, and `Donation` records (see README for the
-    schema). Compatible with any PostgreSQL-compatible host (the deployed
-    instance runs on Railway).
+  - Stores `User`, `Creator`, `Donation`, and `AdminAuditLog` records (see
+    README for the schema). Compatible with any PostgreSQL-compatible host
+    (the deployed instance runs on Railway).
 
 - **CI**: `.github/workflows/ci.yml`
   - Three independent GitHub Actions jobs run on every push/PR to `main`:

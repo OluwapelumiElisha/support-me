@@ -5,7 +5,6 @@ import {
   Networks,
   TransactionBuilder,
   nativeToScVal,
-  rpc,
 } from "@stellar/stellar-sdk";
 import prisma from "../prisma";
 import { Subscription } from "@prisma/client";
@@ -13,12 +12,22 @@ import {
   notifySubscriptionPaymentFailed,
   notifySubscriptionRenewed,
 } from "./subscriptionNotifications";
+import { withSorobanRpcServer } from "./sorobanRpc";
+import { executorHealth } from "./executorHealth";
+import { applyDonationToGoals } from "./goalService";
+import { log } from "../lib/logger";
+import * as Sentry from "@sentry/node";
 
-const RPC_URL = process.env.SOROBAN_RPC_URL || "https://soroban-testnet.stellar.org";
 const NETWORK_PASSPHRASE = Networks.TESTNET;
-const DONATION_CONTRACT_ID = process.env.NEXT_PUBLIC_DONATION_CONTRACT_ID;
-const EXECUTOR_SECRET_KEY = process.env.EXECUTOR_SECRET_KEY;
-const POLL_INTERVAL_MS = Number(process.env.SUBSCRIPTION_EXECUTOR_POLL_INTERVAL_MS) || 60_000;
+
+const getDonationContractId = (): string | undefined =>
+  process.env.NEXT_PUBLIC_DONATION_CONTRACT_ID?.trim() || undefined;
+const getExecutorSecretKey = (): string | undefined =>
+  process.env.EXECUTOR_SECRET_KEY?.trim() || undefined;
+const getPollIntervalMs = (): number => {
+  const configured = Number(process.env.SUBSCRIPTION_EXECUTOR_POLL_INTERVAL_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 60_000;
+};
 
 /**
  * Periodically charges due recurring-donation subscriptions by calling the
@@ -37,34 +46,39 @@ const POLL_INTERVAL_MS = Number(process.env.SUBSCRIPTION_EXECUTOR_POLL_INTERVAL_
  * Mirrors `SorobanEventListener`'s start()/stop()/setInterval() shape.
  */
 export class SubscriptionExecutor {
-  private server = new rpc.Server(RPC_URL);
   private keypair: Keypair | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private running = false;
 
   start(): void {
-    if (!DONATION_CONTRACT_ID) {
-      console.warn(
-        "SubscriptionExecutor: NEXT_PUBLIC_DONATION_CONTRACT_ID is not set, skipping."
-      );
+    const donationContractId = getDonationContractId();
+    if (!donationContractId) {
+      log("warn", "SubscriptionExecutor disabled: NEXT_PUBLIC_DONATION_CONTRACT_ID not set");
+      executorHealth.markDisabled();
       return;
     }
-    if (!EXECUTOR_SECRET_KEY) {
-      console.warn(
-        "SubscriptionExecutor: EXECUTOR_SECRET_KEY is not set, recurring donations will not be charged."
-      );
+    const executorSecretKey = getExecutorSecretKey();
+    if (!executorSecretKey) {
+      log("warn", "SubscriptionExecutor disabled: EXECUTOR_SECRET_KEY not set");
+      executorHealth.markDisabled();
       return;
     }
     if (this.timer) return;
 
-    this.keypair = Keypair.fromSecret(EXECUTOR_SECRET_KEY);
+    this.keypair = Keypair.fromSecret(executorSecretKey);
+    const pollIntervalMs = getPollIntervalMs();
+    const expectedIntervalMs =
+      Number(process.env.SUBSCRIPTION_EXECUTOR_EXPECTED_INTERVAL_MS) || pollIntervalMs * 3;
+    executorHealth.markEnabled(expectedIntervalMs);
     this.timer = setInterval(() => {
       void this.tick();
-    }, POLL_INTERVAL_MS);
+    }, pollIntervalMs);
     void this.tick();
-    console.log(
-      `SubscriptionExecutor: charging due subscriptions every ${POLL_INTERVAL_MS}ms as ${this.keypair.publicKey()}`
-    );
+    log("info", "SubscriptionExecutor started", {
+      executorAddress: this.keypair.publicKey(),
+      pollIntervalMs,
+      expectedIntervalMs,
+    });
   }
 
   stop(): void {
@@ -78,10 +92,15 @@ export class SubscriptionExecutor {
   async tick(): Promise<void> {
     if (this.running) return;
     this.running = true;
+    executorHealth.runStarted();
+    let ok = false;
+    let runError: string | undefined;
     try {
       const due = await prisma.subscription.findMany({
         where: { active: true, nextChargeAt: { lte: new Date() } },
       });
+
+      log("info", "SubscriptionExecutor tick started", { dueCount: due.length });
 
       for (const subscription of due) {
         // One subscription's unexpected error (e.g. a DB write failing after
@@ -89,16 +108,24 @@ export class SubscriptionExecutor {
         try {
           await this.charge(subscription);
         } catch (error) {
-          console.error(
-            `SubscriptionExecutor: could not process subscription ${subscription.id}:`,
-            (error as Error).message
-          );
+          const errorMessage = (error as Error).message;
+          log("error", "SubscriptionExecutor charge failed", {
+            subscriptionId: subscription.id,
+            creatorId: subscription.creatorId,
+            supporterAddress: subscription.supporterAddress,
+            amount: subscription.amount,
+            token: subscription.token,
+            error: errorMessage,
+          });
         }
       }
+      ok = true;
     } catch (error) {
-      console.error("SubscriptionExecutor: tick failed:", (error as Error).message);
+      runError = (error as Error).message;
+      log("error", "SubscriptionExecutor tick failed", { error: runError });
     } finally {
       this.running = false;
+      executorHealth.runFinished(ok, runError);
     }
   }
 
@@ -112,18 +139,31 @@ export class SubscriptionExecutor {
     }
 
     const nextChargeAt = new Date(Date.now() + subscription.intervalSecs * 1000);
-    await prisma.$transaction([
-      prisma.donation.create({
-        data: {
+    const onChainEventId = `${hash}:0:0`;
+    await prisma.$transaction(async (client) => {
+      await client.donation.upsert({
+        where: {
+          transactionHash_operationIndex_eventIndex: {
+            transactionHash: hash,
+            operationIndex: 0,
+            eventIndex: 0,
+          },
+        },
+        update: {},
+        create: {
           creatorId: subscription.creatorId,
           senderAddress: subscription.supporterAddress,
           amount: subscription.amount,
           currency: subscription.token,
           message: "Recurring donation",
           transactionHash: hash,
+          onChainEventId,
+          operationIndex: 0,
+          eventIndex: 0,
+          verified: true,
         },
-      }),
-      prisma.subscription.update({
+      });
+      await client.subscription.update({
         where: { id: subscription.id },
         data: {
           nextChargeAt,
@@ -132,26 +172,61 @@ export class SubscriptionExecutor {
           lastError: null,
           failureNotifiedAt: null,
         },
-      }),
-    ]);
+      });
+      // A recurring donation applies to goal progress the same way a
+      // one-off donation does (see goalService.ts's applyDonationToGoals).
+      await applyDonationToGoals(client, subscription.creatorId, subscription.token, subscription.amount);
+    });
+    executorHealth.recordCharge(subscription.id, "success");
+
+    log("info", "SubscriptionExecutor charge succeeded", {
+      subscriptionId: subscription.id,
+      creatorId: subscription.creatorId,
+      supporterAddress: subscription.supporterAddress,
+      amount: subscription.amount,
+      token: subscription.token,
+      transactionHash: hash,
+      nextChargeAt: nextChargeAt.toISOString(),
+    });
 
     // The charge already settled on-chain and is recorded; a mail outage
     // must not make it look failed (or get it retried), so just log.
     try {
       await notifySubscriptionRenewed(subscription, hash, nextChargeAt);
     } catch (error) {
-      console.error(
-        `SubscriptionExecutor: renewal email failed for subscription ${subscription.id}:`,
-        (error as Error).message
-      );
+      log("error", "SubscriptionExecutor renewal email failed", {
+        subscriptionId: subscription.id,
+        error: (error as Error).message,
+      });
     }
   }
 
   private async recordFailure(subscription: Subscription, message: string): Promise<void> {
-    console.error(
-      `SubscriptionExecutor: charge failed for subscription ${subscription.id}:`,
-      message
-    );
+    log("error", "SubscriptionExecutor charge failed", {
+      subscriptionId: subscription.id,
+      creatorId: subscription.creatorId,
+      supporterAddress: subscription.supporterAddress,
+      amount: subscription.amount,
+      token: subscription.token,
+      error: message,
+    });
+
+    // Report to Sentry with full context for debugging
+    Sentry.captureException(new Error(`Subscription charge failed: ${message}`), {
+      tags: {
+        subscriptionId: String(subscription.id),
+        creatorId: String(subscription.creatorId),
+      },
+      extra: {
+        supporterAddress: subscription.supporterAddress,
+        amount: subscription.amount,
+        token: subscription.token,
+        intervalSecs: subscription.intervalSecs,
+        nextChargeAt: subscription.nextChargeAt?.toISOString(),
+      },
+    });
+
+    executorHealth.recordCharge(subscription.id, "failure", message);
 
     // Email once per failure streak: the executor retries every tick, and a
     // supporter shouldn't get a new email each minute for the same problem.
@@ -160,10 +235,10 @@ export class SubscriptionExecutor {
       try {
         notified = await notifySubscriptionPaymentFailed(subscription, message);
       } catch (error) {
-        console.error(
-          `SubscriptionExecutor: payment-failure email failed for subscription ${subscription.id}:`,
-          (error as Error).message
-        );
+        log("error", "SubscriptionExecutor payment-failure email failed", {
+          subscriptionId: subscription.id,
+          error: (error as Error).message,
+        });
       }
     }
 
@@ -183,8 +258,15 @@ export class SubscriptionExecutor {
    */
   protected async submitCharge(subscription: Subscription): Promise<string> {
     const keypair = this.keypair!;
-    const account = await this.server.getAccount(keypair.publicKey());
-    const contract = new Contract(DONATION_CONTRACT_ID!);
+    const contractId = getDonationContractId();
+    if (!contractId) {
+      throw new Error("Donation contract is not configured");
+    }
+
+    const account = await withSorobanRpcServer("getAccount", (server) =>
+      server.getAccount(keypair.publicKey())
+    );
+    const contract = new Contract(contractId);
 
     const tx = new TransactionBuilder(account, {
       fee: BASE_FEE,
@@ -200,16 +282,38 @@ export class SubscriptionExecutor {
       .setTimeout(60)
       .build();
 
-    const prepared = await this.server.prepareTransaction(tx);
+    const prepared = await withSorobanRpcServer("prepareTransaction", (server) =>
+      server.prepareTransaction(tx)
+    );
     prepared.sign(keypair);
 
-    const sendResult = await this.server.sendTransaction(prepared);
-    return this.confirm(sendResult.hash);
+    // The same signed XDR is submitted to each endpoint. A timeout can happen
+    // after the network accepted the transaction, so a fallback must never
+    // rebuild (and potentially re-sequence) the transaction.
+    const transactionHash = prepared.hash().toString("hex");
+    try {
+      const sendResult = await withSorobanRpcServer("sendTransaction", (server) =>
+        server.sendTransaction(prepared)
+      );
+      return this.confirm(sendResult.hash || transactionHash);
+    } catch (error) {
+      // All endpoints may have timed out after accepting the transaction. Try
+      // the locally computable hash before reporting a failure and retrying the
+      // charge on the next executor tick.
+      try {
+        await this.confirm(transactionHash);
+        return transactionHash;
+      } catch {
+        throw error;
+      }
+    }
   }
 
   private async confirm(hash: string): Promise<string> {
     for (let i = 0; i < 30; i++) {
-      const result = await this.server.getTransaction(hash);
+      const result = await withSorobanRpcServer("getTransaction", (server) =>
+        server.getTransaction(hash)
+      );
       if (result.status === "SUCCESS") return hash;
       if (result.status === "FAILED") {
         throw new Error(`Transaction ${hash} failed on-chain`);

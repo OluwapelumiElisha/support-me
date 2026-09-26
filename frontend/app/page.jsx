@@ -6,6 +6,7 @@ import { useRouter } from 'next/navigation'
 import { useAuth } from '@/context/AuthContext'
 import { TipJar } from '@/components/TipJar'
 import { WalletMenu } from '@/components/WalletMenu'
+import { ThemeToggle } from '@/components/ThemeToggle'
 import { WalletConnectError } from '@/components/WalletConnectError'
 import { categorizeWalletError } from '@/lib/walletErrors'
 import { HugeiconsIcon } from '@hugeicons/react'
@@ -101,7 +102,10 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-background">
       {/* Navigation */}
-      <nav className="sticky top-0 w-full z-50 bg-background border-b-4 border-ink">
+      <nav
+        style={{ top: 'var(--offline-banner-h, 0px)' }}
+        className="sticky w-full z-50 bg-background border-b-4 border-ink"
+      >
         <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center gap-4">
           <div className="flex items-center gap-3">
             <button
@@ -128,6 +132,7 @@ export default function Home() {
             )}
           </div>
           <div className="flex items-center gap-4 shrink-0">
+            <ThemeToggle />
             {user ? (
               <WalletMenu />
             ) : (

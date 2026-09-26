@@ -25,7 +25,8 @@ pub const MAX_MEMO_LENGTH: u32 = 140;
 /// Emitted whenever a donation is settled on-chain. `donor` and `creator`
 /// are indexed as topics so downstream systems (e.g. the backend's event
 /// listener) can filter `getEvents` calls by either party without scanning
-/// every ledger event.
+/// every ledger event. Carries `token` so indexers know which asset was
+/// transferred without requiring additional RPC lookups.
 #[contractevent(topics = ["donated"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DonatedEvent {
@@ -33,12 +34,15 @@ pub struct DonatedEvent {
     pub donor: Address,
     #[topic]
     pub creator: Address,
+    pub token: Address,
     pub amount: i128,
     pub memo: String,
     pub timestamp: u64,
 }
 
-/// Emitted when a supporter starts a recurring donation.
+/// Emitted when a supporter starts a recurring donation. Carries `token`
+/// and `next_charge_at` so the backend can create and reconcile schedules
+/// directly from the event stream.
 #[contractevent(topics = ["subscribed"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscribedEvent {
@@ -47,17 +51,32 @@ pub struct SubscribedEvent {
     #[topic]
     pub creator: Address,
     pub subscription_id: u64,
+    pub token: Address,
     pub amount: i128,
     pub interval_secs: u64,
+    pub next_charge_at: u64,
 }
 
-/// Emitted when a supporter cancels a recurring donation.
+/// Emitted when a supporter cancels a recurring donation. Indexed by both
+/// supporter and creator so both dashboards can track cancellations.
 #[contractevent(topics = ["sub_cancelled"])]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SubscriptionCancelledEvent {
     #[topic]
     pub supporter: Address,
+    #[topic]
+    pub creator: Address,
     pub subscription_id: u64,
+}
+
+/// Emitted when a creator's funding goal is updated.
+#[contractevent(topics = ["goal_upd"])]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GoalUpdatedEvent {
+    #[topic]
+    pub creator: Address,
+    pub goal_amount: i128,
+    pub updated_at: u64,
 }
 
 #[contract]
@@ -127,6 +146,7 @@ impl DonationContract {
             donor: donor.clone(),
             creator: creator.clone(),
             amount,
+            fee_amount: 0,
             memo: memo.clone(),
             timestamp: env.ledger().timestamp(),
         };
@@ -150,6 +170,7 @@ impl DonationContract {
         DonatedEvent {
             donor,
             creator,
+            token,
             amount,
             memo,
             timestamp: env.ledger().timestamp(),
@@ -197,7 +218,7 @@ impl DonationContract {
         let subscription = Subscription {
             supporter: supporter.clone(),
             creator: creator.clone(),
-            token,
+            token: token.clone(),
             amount,
             interval_secs,
             next_charge_at: now + interval_secs,
@@ -213,8 +234,10 @@ impl DonationContract {
             supporter,
             creator,
             subscription_id: id,
+            token,
             amount,
             interval_secs,
+            next_charge_at: now + interval_secs,
         }
         .publish(&env);
 
@@ -273,6 +296,7 @@ impl DonationContract {
             donor: subscription.supporter.clone(),
             creator: subscription.creator.clone(),
             amount: subscription.amount,
+            fee_amount: 0,
             memo: memo.clone(),
             timestamp: now,
         };
@@ -297,6 +321,7 @@ impl DonationContract {
         DonatedEvent {
             donor: subscription.supporter.clone(),
             creator: subscription.creator.clone(),
+            token: subscription.token.clone(),
             amount: subscription.amount,
             memo,
             timestamp: now,
@@ -332,6 +357,7 @@ impl DonationContract {
 
         SubscriptionCancelledEvent {
             supporter,
+            creator: subscription.creator,
             subscription_id,
         }
         .publish(&env);
@@ -342,6 +368,28 @@ impl DonationContract {
         env.storage()
             .persistent()
             .get(&(SUBSCRIPTIONS_KEY, subscription_id))
+    }
+
+    /// Cross-contract call: updates a creator's funding goal in the CreatorRegistry.
+    pub fn set_goal(env: Env, creator: Address, goal_amount: i128) {
+        creator.require_auth();
+        let registry = Self::registry_address(&env);
+        let args: SorobanVec<Val> = (creator.clone(), goal_amount).into_val(&env);
+        let (): () = env.invoke_contract(&registry, &Symbol::new(&env, "set_goal"), args);
+
+        GoalUpdatedEvent {
+            creator,
+            goal_amount,
+            updated_at: env.ledger().timestamp(),
+        }
+        .publish(&env);
+    }
+
+    /// Cross-contract call: reads a creator's funding goal from CreatorRegistry.
+    pub fn get_goal(env: Env, creator: Address) -> Option<i128> {
+        let registry = Self::registry_address(&env);
+        let args: SorobanVec<Val> = (creator,).into_val(&env);
+        env.invoke_contract(&registry, &Symbol::new(&env, "get_goal"), args)
     }
 
     /// Get all donations count (approximate, stored in counter)
@@ -711,5 +759,18 @@ mod tests {
 
         env.ledger().with_mut(|li| li.timestamp = 2_000);
         donation_client.charge_subscription(&executor, &id);
+    }
+
+    #[test]
+    fn test_set_and_get_creator_goal_cross_contract() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        let (_admin, donation_client, _registry_client) = setup(&env);
+
+        let creator = Address::generate(&env);
+        assert_eq!(donation_client.get_goal(&creator), None);
+
+        donation_client.set_goal(&creator, &2500);
+        assert_eq!(donation_client.get_goal(&creator), Some(2500));
     }
 }

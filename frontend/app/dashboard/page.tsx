@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useLayoutEffect } from 'react';
 import Link from 'next/link';
 import { notify } from '@/lib/notify';
 import { HugeiconsIcon } from '@hugeicons/react';
@@ -9,8 +9,11 @@ import { useAuth } from '@/context/AuthContext';
 import { ProtectedRoute } from '@/components/ProtectedRoute';
 import { AppNav } from '@/components/AppNav';
 import { Skeleton } from '@/components/Skeleton';
+import { DashboardSkeleton } from '@/components/DashboardSkeleton';
+import { DonationHistorySkeleton } from '@/components/DonationHistorySkeleton';
 import { TipChart } from '@/components/TipChart';
 import { ShareCard } from '@/components/ShareCard';
+import { ShareModal } from '@/components/ShareModal';
 import { usePrices } from '@/lib/usePrices';
 import { formatUsd } from '@/lib/prices';
 import { API_URL } from '@/lib/api';
@@ -37,6 +40,7 @@ interface Donation {
   currency: string;
   message: string;
   transactionHash: string;
+  eventId?: string;
   createdAt: string;
 }
 
@@ -65,11 +69,29 @@ export default function DashboardPage() {
   const [withdrawals, setWithdrawals] = useState<Withdrawal[]>([]);
   const [donationPage, setDonationPage] = useState(1);
   const [hasMoreDonations, setHasMoreDonations] = useState(false);
+  const [totalDonations, setTotalDonations] = useState<number | null>(null);
+  const [totalPages, setTotalPages] = useState<number>(1);
   const [loadingMoreDonations, setLoadingMoreDonations] = useState(false);
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
+  const [infiniteScroll, setInfiniteScroll] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [showShareCard, setShowShareCard] = useState(false);
+  const [showShareModal, setShowShareModal] = useState(false);
+  const seenDonationEventIds = useRef(new Set<string>());
   const prices = usePrices();
+
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  const prevScrollYRef = useRef<number | null>(null);
+
+  // Preserve scroll position when older donations are appended
+  useLayoutEffect(() => {
+    if (prevScrollYRef.current !== null && typeof window !== 'undefined') {
+      const savedY = prevScrollYRef.current;
+      prevScrollYRef.current = null;
+      window.scrollTo({ top: savedY, behavior: 'instant' });
+    }
+  }, [donations]);
 
   useEffect(() => {
     const fetchCreator = async () => {
@@ -107,9 +129,15 @@ export default function DashboardPage() {
           const items = Array.isArray(donationsData) ? donationsData : donationsData.items || [];
           setDonations(items);
           setDonationPage(1);
-          setHasMoreDonations(
-            Boolean(donationsData.pagination && donationsData.pagination.page < donationsData.pagination.totalPages)
-          );
+          if (donationsData.pagination) {
+            setTotalDonations(donationsData.pagination.total);
+            setTotalPages(donationsData.pagination.totalPages);
+            setHasMoreDonations(donationsData.pagination.page < donationsData.pagination.totalPages);
+          } else {
+            setTotalDonations(Array.isArray(donationsData) ? donationsData.length : items.length);
+            setTotalPages(1);
+            setHasMoreDonations(false);
+          }
         }
 
         if (resWithdrawals.ok) {
@@ -129,6 +157,10 @@ export default function DashboardPage() {
   const loadMoreDonations = async () => {
     if (!creator || !token || loadingMoreDonations || !hasMoreDonations) return;
     setLoadingMoreDonations(true);
+    setLoadMoreError(null);
+    if (typeof window !== 'undefined') {
+      prevScrollYRef.current = window.scrollY;
+    }
     try {
       const nextPage = donationPage + 1;
       const response = await fetch(
@@ -137,15 +169,59 @@ export default function DashboardPage() {
       );
       if (!response.ok) throw new Error('The server returned an error. Please try again.');
       const data = await response.json();
-      setDonations((current) => [...current, ...(data.items || [])]);
+      const newItems: Donation[] = data.items || [];
+
+      setDonations((current) => {
+        const existingIds = new Set(current.map((d) => String(d.id)));
+        const existingHashes = new Set(current.map((d) => d.transactionHash).filter(Boolean));
+        const deduplicated = newItems.filter(
+          (item) => !existingIds.has(String(item.id)) && (!item.transactionHash || !existingHashes.has(item.transactionHash))
+        );
+        return [...current, ...deduplicated];
+      });
+
       setDonationPage(nextPage);
-      setHasMoreDonations(nextPage < data.pagination.totalPages);
+      if (data.pagination) {
+        setTotalDonations(data.pagination.total);
+        setTotalPages(data.pagination.totalPages);
+        setHasMoreDonations(nextPage < data.pagination.totalPages);
+      } else {
+        setHasMoreDonations(false);
+      }
     } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Could not load older donations';
+      setLoadMoreError(msg);
       notify.error('Could not load more donations', err);
     } finally {
       setLoadingMoreDonations(false);
     }
   };
+
+  // Automatically fetch next page when user scrolls near the bottom of the list
+  useEffect(() => {
+    if (!infiniteScroll || !hasMoreDonations || loadingMoreDonations || loading || loadMoreError) {
+      return;
+    }
+
+    const sentinel = sentinelRef.current;
+    if (!sentinel) return;
+    if (typeof IntersectionObserver === 'undefined') return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (entry?.isIntersecting) {
+          loadMoreDonations();
+        }
+      },
+      { rootMargin: '200px' }
+    );
+
+    observer.observe(sentinel);
+    return () => {
+      observer.disconnect();
+    };
+  }, [infiniteScroll, hasMoreDonations, loadingMoreDonations, loading, loadMoreError, donationPage, creator, token]);
 
   // Subscribe to the backend's SSE stream so newly confirmed on-chain
   // donations show up here live, without needing to refresh the page.
@@ -162,6 +238,8 @@ export default function DashboardPage() {
         memo: string;
         timestamp: number;
         txHash: string;
+        eventId?: string;
+        currency?: string;
       };
       try {
         payload = JSON.parse(event.data);
@@ -171,19 +249,26 @@ export default function DashboardPage() {
 
       if (payload.creator !== creator.walletAddress) return;
 
+      const eventKey = payload.eventId || payload.txHash;
+      if (seenDonationEventIds.current.has(eventKey)) return;
+      seenDonationEventIds.current.add(eventKey);
+
       setDonations((prev) => {
-        if (prev.some((d) => d.transactionHash === payload.txHash)) return prev;
+        if (!payload.eventId && prev.some((d) => d.transactionHash === payload.txHash)) return prev;
+        if (payload.eventId && prev.some((d) => d.eventId === payload.eventId)) return prev;
         const newDonation: Donation = {
-          id: payload.txHash,
+          id: payload.eventId || payload.txHash,
           senderAddress: payload.donor,
           amount: Number(payload.amount) / 1e7,
-          currency: 'XLM',
+          currency: payload.currency || 'XLM',
           message: payload.memo,
           transactionHash: payload.txHash,
+          eventId: payload.eventId,
           createdAt: new Date(payload.timestamp * 1000).toISOString(),
         };
         return [newDonation, ...prev];
       });
+      setTotalDonations((prev) => (prev !== null ? prev + 1 : null));
 
       notify.success('New donation received!', {
         icon: <HugeiconsIcon icon={PartyIcon} size={18} strokeWidth={1.5} />,
@@ -201,35 +286,7 @@ export default function DashboardPage() {
   if (loading) {
     return (
       <ProtectedRoute>
-        <div className="min-h-screen bg-background">
-          <AppNav />
-          <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
-            <Skeleton className="h-9 w-40 mb-8" />
-
-            <div className="grid md:grid-cols-2 gap-6 mb-8">
-              {[0, 1].map((i) => (
-                <div key={i} className="card-brutal p-6">
-                  <Skeleton className="h-4 w-28 mb-3" />
-                  <Skeleton className="h-8 w-24" />
-                </div>
-              ))}
-            </div>
-
-            <div className="card-brutal p-6 mb-8">
-              <Skeleton className="h-5 w-32 mb-4" />
-              <Skeleton className="h-48 w-full" />
-            </div>
-
-            <div className="card-brutal p-6">
-              <Skeleton className="h-5 w-40 mb-4" />
-              <div className="space-y-3">
-                {[0, 1, 2, 3].map((i) => (
-                  <Skeleton key={i} className="h-10 w-full" />
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
+        <DashboardSkeleton />
       </ProtectedRoute>
     );
   }
@@ -282,7 +339,7 @@ export default function DashboardPage() {
             <h1 className="text-4xl font-extrabold text-ink tracking-tight">Dashboard</h1>
             <button
               type="button"
-              onClick={() => setShowShareCard(true)}
+              onClick={() => setShowShareModal(true)}
               className="btn-brutal btn-brutal-primary shrink-0"
             >
               Share
@@ -435,19 +492,63 @@ export default function DashboardPage() {
                 })}
               </ul>
             )}
-            {hasMoreDonations && (
-              <button
-                type="button"
-                onClick={loadMoreDonations}
-                disabled={loadingMoreDonations}
-                className="btn-brutal btn-brutal-white mt-4"
-              >
-                {loadingMoreDonations ? 'Loading…' : 'Load older donations'}
-              </button>
+            {loadMoreError && (
+              <div className="mt-4 p-3 bg-red-50 border-2 border-red-500 rounded-lg flex items-center justify-between gap-2 text-sm text-red-700">
+                <span>{loadMoreError}</span>
+                <button
+                  type="button"
+                  onClick={loadMoreDonations}
+                  className="px-3 py-1 bg-red-600 text-white font-bold rounded text-xs hover:bg-red-700 transition-colors"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+
+            {loadingMoreDonations && (
+              <div className="mt-4 space-y-3">
+                <DonationHistorySkeleton rows={2} />
+                <div
+                  data-testid="donations-loading-indicator"
+                  className="p-3 bg-brand-light-purple/20 border-2 border-dashed border-ink/20 rounded-lg flex items-center justify-center gap-2 text-sm font-bold text-ink"
+                >
+                  <div className="w-4 h-4 border-2 border-brand-purple border-t-transparent rounded-full animate-spin" />
+                  <span>Loading older donations…</span>
+                </div>
+              </div>
+            )}
+
+            {hasMoreDonations && !loadingMoreDonations && (
+              <div className="mt-4 flex flex-col items-center gap-2">
+                <button
+                  type="button"
+                  onClick={loadMoreDonations}
+                  className="btn-brutal btn-brutal-white w-full sm:w-auto"
+                >
+                  Load older donations
+                </button>
+                {infiniteScroll && (
+                  <div ref={sentinelRef} className="h-1 w-full" aria-hidden="true" />
+                )}
+              </div>
+            )}
+
+            {!hasMoreDonations && totalDonations !== null && donations.length > 20 && (
+              <p className="text-center text-xs text-muted font-bold mt-4 pt-4 border-t border-ink/10">
+                All {totalDonations} donations loaded
+              </p>
             )}
           </div>
         </div>
       </div>
+
+      {showShareModal && (
+        <ShareModal
+          creator={creator}
+          onClose={() => setShowShareModal(false)}
+          onOpenShareCard={() => setShowShareCard(true)}
+        />
+      )}
 
       {showShareCard && (
         <ShareCard creator={creator} donations={donations} onClose={() => setShowShareCard(false)} />

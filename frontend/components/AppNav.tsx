@@ -14,6 +14,7 @@ import {
   Cancel01Icon,
 } from '@hugeicons/core-free-icons';
 import { WalletMenu } from '@/components/WalletMenu';
+import { ThemeToggle } from '@/components/ThemeToggle';
 
 const LINKS = [
   { href: '/app', label: 'App', icon: GridViewIcon },
@@ -34,7 +35,10 @@ export function AppNav() {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   return (
-    <nav className="sticky top-0 w-full z-50 bg-background border-b-4 border-ink">
+    <nav
+      style={{ top: 'var(--offline-banner-h, 0px)' }}
+      className="sticky w-full z-50 bg-background border-b-4 border-ink"
+    >
       <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center gap-4">
         <div className="flex items-center gap-3">
           <button
@@ -71,6 +75,7 @@ export function AppNav() {
         </div>
 
         <div className="flex items-center gap-4 shrink-0">
+          <ThemeToggle />
           <WalletMenu />
         </div>
       </div>
